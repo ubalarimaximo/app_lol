@@ -1,6 +1,5 @@
 # Compilados PyInstaller
 build/
-dist/
 
 # Cache de runtime (se genera automáticamente al correr la app)
 cache/
