@@ -1,0 +1,26 @@
+# Compilados PyInstaller
+build/
+dist/
+
+# Cache de runtime (se genera automáticamente al correr la app)
+cache/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.suo
+
+# Windows
+Thumbs.db
+Desktop.ini
