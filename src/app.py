@@ -92,10 +92,12 @@ class LoLAssistantApp:
         self._role_icons:     Dict           = {}  # role str → CTkImage
         self._mastery:        List[Dict]     = []  # maestría del jugador (top N)
 
-        # counters dinámicos
-        self._seen_enemy_cids: set           = set()   # picks ya procesados
-        self._counter_scores:  Dict[int,int] = {}      # cid → puntos acumulados
-        self._synergy_fetched: bool          = False   # ya pedimos sinergia este champ select
+        # counters y sinergias dinámicos
+        self._seen_enemy_cids: set           = set()   # picks enemigos ya procesados
+        self._seen_ally_cids:  set           = set()   # picks aliados ya procesados
+        self._counter_scores:  Dict[int,int] = {}      # cid → puntos acumulados (counters)
+        self._synergy_scores:  Dict[int,int] = {}      # cid → puntos acumulados (sinergias)
+        self._synergy_fetched: bool          = False   # ya pedimos sinergia final este champ select
 
         self._load_role_icons()
         self._build_ui()
@@ -130,7 +132,8 @@ class LoLAssistantApp:
             "champ_select":     self._on_champ_select,
             "champ_select_end": self._on_champ_select_end,
             "data_ready":       self._on_data_ready,
-            "counters_updated": self._on_counters_updated,
+            "counters_updated":  self._on_counters_updated,
+            "synergy_scores_updated": self._on_synergy_scores_updated,
             "synergy_ready":    self._on_synergy_ready,
         }
         fn = handlers.get(kind)
@@ -388,8 +391,6 @@ class LoLAssistantApp:
         recs: List[Dict] = []
         is_mastery = False
 
-        _TIER_RANK = {"S": 0, "A": 1, "B": 2, "C": 3, "D": 4, "": 5}
-
         if not self._data.initialized:
             pass  # se muestra spinner abajo
         else:
@@ -397,15 +398,20 @@ class LoLAssistantApp:
             raw = self._data.get_recommendations(role, enemy_ids, ally_ids, top_n=20)
             recs = [dict(c) for c in raw]  # copias para no mutar el cache
 
-            if self._counter_scores and recs:
-                # Re-rankear: tier base ajustado por counter scores
+            has_context = bool(self._counter_scores) or bool(self._synergy_scores)
+            if has_context and recs:
+                _TIER_SCORE = {"S": 12, "A": 9, "B": 6, "C": 3, "D": 0, "": 0}
                 def _sort_key(c):
-                    tr    = _TIER_RANK.get(c.get("tier", ""), 5)
-                    boost = min(self._counter_scores.get(c["id"], 0), 3)
-                    return (tr - boost, -c.get("winRate", 0))
+                    base    = _TIER_SCORE.get(c.get("tier", ""), 0)
+                    counter = min(self._counter_scores.get(c["id"], 0), 6)
+                    synergy = min(self._synergy_scores.get(c["id"], 0), 6)
+                    return (-(base + counter + synergy), -c.get("winRate", 0))
                 recs.sort(key=_sort_key)
-                for c in recs:
+                _DYN_TIER = ["S","S","S","A","A","A","B","B","B","B","C","C","C","D","D"]
+                for i, c in enumerate(recs):
                     c["counterScore"] = self._counter_scores.get(c["id"], 0)
+                    c["synergyScore"] = self._synergy_scores.get(c["id"], 0)
+                    c["tier"] = _DYN_TIER[i] if i < len(_DYN_TIER) else "D"
 
             recs = recs[:15]
 
@@ -413,7 +419,7 @@ class LoLAssistantApp:
                 recs = self._get_mastery_recs(enemy_ids, ally_ids, top_n=15)
                 is_mastery = bool(recs)
 
-        has_counters = bool(self._counter_scores) and not is_mastery
+        has_context_tag = (bool(self._counter_scores) or bool(self._synergy_scores)) and not is_mastery
 
         # Construir UI
         frame = ctk.CTkFrame(self._content, fg_color=C_PANEL, corner_radius=10)
@@ -423,7 +429,7 @@ class LoLAssistantApp:
         hdr.pack(fill="x", padx=14, pady=(12, 6))
 
         source      = "TUS FAVORITOS" if is_mastery else "RECOMENDADOS"
-        counter_tag = "  ⚔ vs enemigos" if has_counters else ""
+        counter_tag = "  ⚔✦ análisis en curso" if has_context_tag else ""
         role_label  = ROLE_LABEL.get(role, role).upper() if role else "SIN ROL ASIGNADO"
 
         ctk.CTkLabel(
@@ -599,6 +605,7 @@ class LoLAssistantApp:
         card.grid_propagate(False)
 
         counter_score = champ.get("counterScore", 0)
+        synergy_score = champ.get("synergyScore", 0)
 
         top = ctk.CTkFrame(card, fg_color="transparent")
         top.pack(fill="x", pady=(7, 0))
@@ -650,13 +657,21 @@ class LoLAssistantApp:
                 text_color=C_MUTED,
             ).pack(anchor="w")
 
-        if counter_score:
-            ctk.CTkLabel(
-                right,
-                text="⚔ COUNTER",
-                font=ctk.CTkFont("Segoe UI", 8, "bold"),
-                text_color=C_GOLD,
-            ).pack(anchor="w")
+        if counter_score or synergy_score:
+            tags_frame = ctk.CTkFrame(right, fg_color="transparent")
+            tags_frame.pack(anchor="w")
+            if counter_score:
+                ctk.CTkLabel(
+                    tags_frame, text="⚔",
+                    font=ctk.CTkFont("Segoe UI", 10, "bold"),
+                    text_color=C_GOLD,
+                ).pack(side="left", padx=(0, 2))
+            if synergy_score:
+                ctk.CTkLabel(
+                    tags_frame, text="✦",
+                    font=ctk.CTkFont("Segoe UI", 10, "bold"),
+                    text_color=C_GREEN,
+                ).pack(side="left")
 
         name = champ.get("name", "?")
         if len(name) > 13:
@@ -757,11 +772,24 @@ class LoLAssistantApp:
             self._counter_scores[cid] = self._counter_scores.get(cid, 0) + pts
         self._enqueue("counters_updated")
 
+    def _fetch_ally_synergy_bg(self, ally_cid: int, ally_role: str):
+        synergy_list = self._data.fetch_synergy_for(ally_cid, ally_role)
+        if not synergy_list:
+            return
+        for rank, cid in enumerate(synergy_list):
+            pts = 3 if rank < 8 else (2 if rank < 16 else 1)
+            self._synergy_scores[cid] = self._synergy_scores.get(cid, 0) + pts
+        self._enqueue("synergy_scores_updated")
+
     def _fetch_synergy_bg(self, my_cid: int, my_role: str):
         self._data.fetch_synergy_for(my_cid, my_role)
         self._enqueue("synergy_ready")
 
     def _on_counters_updated(self, _=None):
+        if self._session:
+            self._show_champ_select(self._session)
+
+    def _on_synergy_scores_updated(self, _=None):
         if self._session:
             self._show_champ_select(self._session)
 
@@ -830,6 +858,18 @@ class LoLAssistantApp:
                         daemon=True,
                     ).start()
 
+            for ally in my_team:
+                acid  = ally.get("championId", 0)
+                acell = ally.get("cellId", -1)
+                if acid > 0 and acell != local_cell and acid not in self._seen_ally_cids:
+                    self._seen_ally_cids.add(acid)
+                    arole = ally.get("assignedPosition", "")
+                    threading.Thread(
+                        target=self._fetch_ally_synergy_bg,
+                        args=(acid, arole),
+                        daemon=True,
+                    ).start()
+
         my_champ = my_cell.get("championId", 0)
         my_role  = my_cell.get("assignedPosition", "")
         all_picked = (
@@ -851,7 +891,9 @@ class LoLAssistantApp:
         self._session          = None
         self._session_hash     = 0
         self._seen_enemy_cids  = set()
+        self._seen_ally_cids   = set()
         self._counter_scores   = {}
+        self._synergy_scores   = {}
         self._synergy_fetched  = False
 
     def _on_data_ready(self, _=None):
