@@ -16,8 +16,10 @@ if getattr(sys, "frozen", False):
 else:
     _APP_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-CACHE_DIR = os.path.join(_APP_DIR, "cache")
-ICONS_DIR = os.path.join(CACHE_DIR, "icons")
+CACHE_DIR  = os.path.join(_APP_DIR, "cache")
+ICONS_DIR  = os.path.join(CACHE_DIR, "icons")
+ITEMS_DIR  = os.path.join(CACHE_DIR, "items")
+RUNES_DIR  = os.path.join(CACHE_DIR, "runes")
 
 _CACHE_TTL_CHAMPIONS = 3600 * 24   # 24 h — datos estáticos
 _CACHE_TTL_TIER      = 3600 * 6    # 6 h  — tier list
@@ -88,9 +90,19 @@ class DataManager:
         self._counter_cache: Dict[int, List[int]] = {}
         # my_cid → [synergy_cid, ...] en orden (mejor sinergia primero)
         self._synergy_cache: Dict[int, List[int]] = {}
+        # (cid, role) → {runes: [...], items: [...]}
+        self._builds_cache: Dict = {}
+        # rune_id → {name, icon, type}
+        self._rune_meta: Dict[int, Dict] = {}
 
         self._initialized = False
         self.on_ready: Optional[callable] = None
+
+    def clear_game_cache(self):
+        """Libera caché en memoria acumulada durante la partida."""
+        self._counter_cache.clear()
+        self._synergy_cache.clear()
+        self._builds_cache.clear()
 
     # ------------------------------------------------------------------ #
     #  Inicialización asíncrona                                            #
@@ -102,6 +114,7 @@ class DataManager:
 
     def _init_worker(self):
         self._load_champions()
+        self._load_rune_meta()
         self._load_tier_data()
         self._preload_icons()
         self._initialized = True
@@ -543,6 +556,260 @@ class DataManager:
             print(f"[DataManager] synergy {key}: {e}")
             self._synergy_cache[my_cid] = []
             return []
+
+    # ------------------------------------------------------------------ #
+    #  Runas metadata                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _load_rune_meta(self):
+        cache = os.path.join(CACHE_DIR, "runes_meta.json")
+        if _cache_valid(cache, _CACHE_TTL_CHAMPIONS):
+            try:
+                with open(cache, encoding="utf-8") as f:
+                    raw = json.load(f)
+                self._rune_meta = {int(k): v for k, v in raw.items()}
+                return
+            except Exception:
+                pass
+        if not self._patch:
+            return
+        try:
+            url = (
+                f"https://ddragon.leagueoflegends.com/cdn/"
+                f"{self._patch}/data/en_US/runesReforged.json"
+            )
+            resp = self._session.get(url, timeout=10).json()
+            for path_data in resp:
+                pid = path_data["id"]
+                self._rune_meta[pid] = {
+                    "name": path_data["name"],
+                    "icon": path_data["icon"],
+                    "type": "path",
+                }
+                for slot in path_data.get("slots", []):
+                    for rune in slot.get("runes", []):
+                        self._rune_meta[rune["id"]] = {
+                            "name": rune["name"],
+                            "icon": rune["icon"],
+                            "type": "rune",
+                        }
+            with open(cache, "w", encoding="utf-8") as f:
+                json.dump({str(k): v for k, v in self._rune_meta.items()}, f)
+        except Exception as e:
+            print(f"[DataManager] rune meta: {e}")
+
+    def get_rune_name(self, rune_id: int) -> str:
+        meta = self._rune_meta.get(rune_id)
+        return meta["name"] if meta else ""
+
+    def get_rune_icon(self, rune_id: int, size: Tuple[int, int] = (32, 32)) -> Optional[Image.Image]:
+        meta = self._rune_meta.get(rune_id)
+        if not meta:
+            return None
+        os.makedirs(RUNES_DIR, exist_ok=True)
+        icon_path = os.path.join(RUNES_DIR, f"{rune_id}.png")
+        if not os.path.exists(icon_path):
+            self._download_rune_icon(rune_id, meta.get("icon", ""))
+        try:
+            return Image.open(icon_path).resize(size, Image.LANCZOS)
+        except Exception:
+            return None
+
+    def _download_rune_icon(self, rune_id: int, icon_rel: str):
+        if not icon_rel:
+            return
+        url = f"https://ddragon.leagueoflegends.com/cdn/img/{icon_rel}"
+        try:
+            resp = self._session.get(url, timeout=8)
+            if resp.status_code == 200:
+                os.makedirs(RUNES_DIR, exist_ok=True)
+                with open(os.path.join(RUNES_DIR, f"{rune_id}.png"), "wb") as f:
+                    f.write(resp.content)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    #  Iconos de items                                                     #
+    # ------------------------------------------------------------------ #
+
+    def get_item_icon(self, item_id: int, size: Tuple[int, int] = (32, 32)) -> Optional[Image.Image]:
+        os.makedirs(ITEMS_DIR, exist_ok=True)
+        icon_path = os.path.join(ITEMS_DIR, f"{item_id}.png")
+        if not os.path.exists(icon_path):
+            self._download_item_icon(item_id)
+        try:
+            return Image.open(icon_path).resize(size, Image.LANCZOS)
+        except Exception:
+            return None
+
+    def _download_item_icon(self, item_id: int):
+        if not self._patch:
+            return
+        url = (
+            f"https://ddragon.leagueoflegends.com/cdn/"
+            f"{self._patch}/img/item/{item_id}.png"
+        )
+        try:
+            resp = self._session.get(url, timeout=8)
+            if resp.status_code == 200:
+                os.makedirs(ITEMS_DIR, exist_ok=True)
+                with open(os.path.join(ITEMS_DIR, f"{item_id}.png"), "wb") as f:
+                    f.write(resp.content)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    #  Builds (runas + items desde op.gg)                                  #
+    # ------------------------------------------------------------------ #
+
+    def fetch_builds_for(self, cid: int, role: str) -> Optional[Dict]:
+        """Devuelve {runes:[...], items:[...]} con las top 3 builds.
+        Bloqueante — llamar desde hilo background."""
+        cache_key = (cid, role)
+        if cache_key in self._builds_cache:
+            return self._builds_cache[cache_key]
+
+        key = self._champ_key.get(cid, "")
+        if not key:
+            return None
+
+        slug     = key.lower()
+        role_seg = self._OPGG_ROLE_SLUG.get(role.lower(), "")
+        url = (
+            f"https://www.op.gg/lol/champions/{slug}/build/{role_seg}"
+            if role_seg else
+            f"https://www.op.gg/lol/champions/{slug}/build"
+        )
+        try:
+            resp = self._session.get(url, headers=_OPGG_HEADERS, timeout=15)
+            if resp.status_code != 200:
+                self._builds_cache[cache_key] = None
+                return None
+            builds = self._parse_opgg_builds(resp.text)
+            self._builds_cache[cache_key] = builds
+            print(
+                f"[DataManager] builds {key}: "
+                f"runes={len(builds.get('runes', []))}, "
+                f"items={len(builds.get('items', []))}"
+            )
+            return builds
+        except Exception as e:
+            print(f"[DataManager] builds {key}: {e}")
+            self._builds_cache[cache_key] = None
+            return None
+
+    def _parse_opgg_builds(self, html: str) -> Dict:
+        result: Dict = {"runes": [], "items": []}
+
+        # Formato nuevo: React Server Components (RSC) — op.gg migró de __NEXT_DATA__
+        chunks = re.findall(r'self\.__next_f\.push\(\[1,"(.*?)"\]\)', html, re.DOTALL)
+        if chunks:
+            self._extract_builds_rsc(' '.join(chunks), result)
+
+        # Fallback: formato antiguo __NEXT_DATA__ (por si vuelven o en otras páginas)
+        if not result["runes"] and not result["items"]:
+            match = re.search(
+                r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+                html, re.DOTALL,
+            )
+            if match:
+                try:
+                    data = json.loads(match.group(1))
+                    self._extract_builds_legacy(data, result, depth=0)
+                except Exception as e:
+                    print(f"[DataManager] parse builds JSON (legacy): {e}")
+
+        return result
+
+    def _extract_builds_rsc(self, combined: str, result: Dict):
+        """Extrae runes e items del formato RSC de op.gg."""
+        # Runas: buscar importClientData con primaryStyleId/subStyleId/selectedPerkIds
+        for m in re.finditer(
+            r'primaryStyleId.{1,6}(\d{4,5}).{1,40}subStyleId.{1,6}(\d{4,5}).{1,60}selectedPerkIds.{1,6}\[([0-9,\s]+)\]',
+            combined,
+        ):
+            primary_id   = int(m.group(1))
+            secondary_id = int(m.group(2))
+            ids = [int(x.strip()) for x in m.group(3).split(',') if x.strip()]
+            if not ids:
+                continue
+            # Los últimos 3 IDs son stat shards, los anteriores son runas
+            stat_ids  = ids[-3:] if len(ids) >= 3 else []
+            rune_ids  = ids[:-3] if len(ids) > 3 else ids
+            result["runes"].append({
+                "primary_page_id":   primary_id,
+                "primary_rune_ids":  rune_ids,
+                "secondary_page_id": secondary_id,
+                "secondary_rune_ids": [],
+                "stat_mod_ids":      stat_ids,
+                "win_rate":  0,
+                "pick_rate": 0,
+            })
+            if len(result["runes"]) >= 3:
+                break
+
+        # Items: cada bloque core_items_N es una build distinta
+        parts = re.split(r'core_items_\d+', combined)
+        for block in parts[1:4]:
+            ids_raw  = re.findall(r'metaId.{1,6}(\d{4,5})', block[:3000])
+            item_ids = [int(x) for x in ids_raw if 1000 <= int(x) <= 9999]
+            if item_ids:
+                result["items"].append({
+                    "ids":      item_ids[:5],
+                    "win_rate":  0,
+                    "pick_rate": 0,
+                })
+
+    def _extract_builds_legacy(self, obj, result: Dict, depth: int):
+        """Parser para el antiguo formato __NEXT_DATA__ de op.gg."""
+        if depth > 14:
+            return
+        if isinstance(obj, list) and obj and isinstance(obj[0], dict):
+            first = obj[0]
+            if not result["runes"] and (
+                "primary_page_id" in first or "primaryPageId" in first
+                or "primary_rune_ids" in first or "primaryRuneIds" in first
+            ):
+                for r in obj[:3]:
+                    pp  = r.get("primary_page_id") or r.get("primaryPageId")
+                    prs = r.get("primary_rune_ids") or r.get("primaryRuneIds") or []
+                    sp  = r.get("secondary_page_id") or r.get("secondaryPageId")
+                    srs = r.get("secondary_rune_ids") or r.get("secondaryRuneIds") or []
+                    sm  = r.get("stat_mod_ids") or r.get("statModIds") or []
+                    wr  = r.get("win_rate") or r.get("winRate") or 0
+                    pr  = r.get("pick_rate") or r.get("pickRate") or 0
+                    if pp and prs:
+                        result["runes"].append({
+                            "primary_page_id":   pp,
+                            "primary_rune_ids":  prs,
+                            "secondary_page_id": sp,
+                            "secondary_rune_ids": srs,
+                            "stat_mod_ids":      sm,
+                            "win_rate":  wr * 100 if 0 < wr < 1 else wr,
+                            "pick_rate": pr * 100 if 0 < pr < 1 else pr,
+                        })
+                return
+            if not result["items"] and "ids" in first:
+                ids_val = first.get("ids")
+                if isinstance(ids_val, list) and ids_val and isinstance(ids_val[0], int):
+                    for ib in obj[:3]:
+                        ids = ib.get("ids", [])
+                        wr  = ib.get("win_rate") or ib.get("winRate") or 0
+                        pr  = ib.get("pick_rate") or ib.get("pickRate") or 0
+                        if ids:
+                            result["items"].append({
+                                "ids":      ids[:5],
+                                "win_rate":  wr * 100 if 0 < wr < 1 else wr,
+                                "pick_rate": pr * 100 if 0 < pr < 1 else pr,
+                            })
+                    if result["items"]:
+                        return
+        if isinstance(obj, list):
+            for item in obj:
+                self._extract_builds_legacy(item, result, depth + 1)
+        elif isinstance(obj, dict):
+            for v in obj.values():
+                self._extract_builds_legacy(v, result, depth + 1)
 
     @property
     def initialized(self) -> bool:

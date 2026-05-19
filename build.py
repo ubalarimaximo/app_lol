@@ -1,5 +1,5 @@
 """
-Genera LoLAssistant.exe en la carpeta dist/LoLAssistant/
+Genera Maxinualete.exe en la carpeta dist/
 Uso: python build.py
 """
 import subprocess
@@ -46,7 +46,7 @@ def main():
         "--noconfirm",
         "--onefile",                          # un solo .exe
         "--windowed",                         # sin consola negra
-        "--name", "LoLAssistant",
+        "--name", "Maxinualete",
         "--add-data", f"{ctk_path}{os.pathsep}customtkinter",
         "--add-data", f"{app_dir / 'assets'}{os.pathsep}assets",
     ]
@@ -59,7 +59,7 @@ def main():
     print("Construyendo .exe (puede tardar 1-2 minutos)...\n")
     subprocess.run(cmd, check=True, cwd=app_dir)
 
-    exe_path = app_dir / "dist" / "LoLAssistant.exe"
+    exe_path = app_dir / "dist" / "Maxinualete.exe"
     if exe_path.exists():
         print(f"\nOK! Ejecutable generado en:\n  {exe_path}")
     else:

@@ -63,14 +63,14 @@ ROLE_ICON_FILE = {
 class LoLAssistantApp:
     def __init__(self):
         self._root = ctk.CTk()
-        self._root.title("LoL Assistant")
+        self._root.title("Maxinualete")
         self._root.geometry("960x760")
         self._root.minsize(820, 640)
         self._root.configure(fg_color=C_BG)
 
         try:
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("LoLAssistant")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Maxinualete")
         except Exception:
             pass
 
@@ -175,7 +175,7 @@ class LoLAssistantApp:
         inner.pack(fill="both", expand=True, padx=24, pady=10)
 
         ctk.CTkLabel(
-            inner, text="⚡  LoL Assistant",
+            inner, text="⚡  Maxinualete",
             font=ctk.CTkFont("Segoe UI", 20, "bold"),
             text_color=C_GOLD_BRIGHT,
         ).pack(side="left")
@@ -199,8 +199,13 @@ class LoLAssistantApp:
         sep.pack(fill="x")
 
         # ── Contenido principal ───────────────────────────────────────── #
-        self._content = ctk.CTkFrame(self._root, fg_color="transparent")
-        self._content.pack(fill="both", expand=True, padx=16, pady=12)
+        # _content_host es permanente (nunca se destruye); los frames de
+        # contenido se superponen con place para evitar el flash negro.
+        self._content_host = ctk.CTkFrame(self._root, fg_color="transparent")
+        self._content_host.pack(fill="both", expand=True, padx=16, pady=12)
+
+        self._content = ctk.CTkFrame(self._content_host, fg_color="transparent")
+        self._content.place(relx=0, rely=0, relwidth=1, relheight=1)
 
         self._show_idle("Esperando el cliente de League of Legends...")
 
@@ -209,14 +214,17 @@ class LoLAssistantApp:
     # ------------------------------------------------------------------ #
 
     def _prepare_content(self) -> ctk.CTkFrame:
-        """Crea un nuevo self._content invisible y devuelve el viejo."""
         old = self._content
-        self._content = ctk.CTkFrame(self._root, fg_color="transparent")
+        self._content = ctk.CTkFrame(self._content_host, fg_color="transparent")
         return old
 
     def _commit_content(self, old: ctk.CTkFrame):
-        """Muestra el nuevo self._content y destruye el viejo de forma atómica."""
-        self._content.pack(fill="both", expand=True, padx=16, pady=12)
+        # Nuevo frame se coloca encima del viejo (mayor z-order).
+        # update_idletasks() lo renderiza antes de destruir el viejo,
+        # eliminando el flash negro.
+        self._content.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self._root.update_idletasks()
+        old.place_forget()
         old.destroy()
 
     # ── Vista idle ────────────────────────────────────────────────────── #
@@ -300,16 +308,9 @@ class LoLAssistantApp:
         # ── Bans ──────────────────────────────────────────────────────── #
         self._bans_row(bans, session)
 
-        # ── Panel inferior: scores si todos pickearon, recomendaciones si no ── #
-        all_picks_done = (
-            my_champ > 0
-            and all(c.get("championId", 0) > 0 for c in my_team)
-            and all(c.get("championId", 0) > 0 for c in their_team)
-        )
-        if all_picks_done:
-            self._scores_panel(my_champ, my_team, their_team, local_cell)
-        elif my_champ > 0:
-            self._builds_panel(my_champ, my_role)
+        # ── Panel inferior: builds+scores si el user pickeó, recomendaciones si no ── #
+        if my_champ > 0:
+            self._scores_and_builds_panel(my_champ, my_team, their_team, local_cell, my_role)
         else:
             role_display = ROLE_LABEL.get(my_role, my_role).upper() if my_role else "SIN ROL ASIGNADO"
             self._recommendations_panel(my_role, enemy_ids, ally_ids + ban_ids, role_display)
@@ -535,7 +536,7 @@ class LoLAssistantApp:
                 break
         return result
 
-    # ── Panel de scores finales ───────────────────────────────────────── #
+    # ── Panel combinado: scores (izq) + builds/runas (der) ───────────── #
 
     @staticmethod
     def _rank_score(ranked_list: List[int], cid: int) -> float:
@@ -545,60 +546,158 @@ class LoLAssistantApp:
         except ValueError:
             return 0.0
 
-    def _scores_panel(
+    def _scores_and_builds_panel(
         self, my_cid: int, my_team: List[Dict],
-        their_team: List[Dict], local_cell: int,
+        their_team: List[Dict], local_cell: int, my_role: str,
     ):
-        frame = ctk.CTkFrame(self._content, fg_color=C_PANEL, corner_radius=12)
-        frame.pack(fill="both", expand=True)
+        outer = ctk.CTkFrame(self._content, fg_color=C_PANEL, corner_radius=10)
+        outer.pack(fill="both", expand=True)
 
-        hdr = ctk.CTkFrame(frame, fg_color="transparent")
-        hdr.pack(fill="x", padx=14, pady=(12, 6))
+        split = ctk.CTkFrame(outer, fg_color="transparent")
+        split.pack(fill="both", expand=True, padx=12, pady=10)
+
+        # ── Izquierda: análisis sinergia + counter ─────────────────── #
+        left = ctk.CTkFrame(split, fg_color="transparent")
+        left.pack(side="left", fill="both", expand=True)
+
         ctk.CTkLabel(
-            hdr, text="ANÁLISIS FINAL",
-            font=ctk.CTkFont("Segoe UI", 13, "bold"),
+            left, text="ANÁLISIS",
+            font=ctk.CTkFont("Segoe UI", 12, "bold"),
             text_color=C_BLUE_BRIGHT,
-        ).pack(side="left")
+        ).pack(anchor="w", pady=(0, 8))
 
-        sep = ctk.CTkFrame(frame, fg_color=C_BORDER, height=1, corner_radius=0)
-        sep.pack(fill="x", padx=10, pady=(0, 14))
-
-        # Sinergia: cómo va mi campeón con cada aliado
         synergy_list = self._data._synergy_cache.get(my_cid, [])
-        ally_scores  = [
-            (c["championId"], self._rank_score(synergy_list, c["championId"]))
-            for c in my_team
-            if c.get("championId", 0) > 0 and c.get("cellId") != local_cell
-        ]
-        syn_avg = round(sum(s for _, s in ally_scores) / len(ally_scores), 1) if ally_scores else 0.0
-        self._score_row(frame, "Synergy Average", syn_avg, ally_scores)
+        ally_cells   = [c for c in my_team if c.get("championId", 0) > 0 and c.get("cellId") != local_cell]
+        if ally_cells and synergy_list:
+            ally_scores = [(c["championId"], self._rank_score(synergy_list, c["championId"])) for c in ally_cells]
+            syn_avg = round(sum(s for _, s in ally_scores) / len(ally_scores), 1)
+            self._score_row(left, "Sinergia", syn_avg, ally_scores)
+        else:
+            ctk.CTkLabel(
+                left, text="Sinergia  —  analizando...",
+                text_color=C_MUTED, font=ctk.CTkFont("Segoe UI", 10),
+            ).pack(anchor="w")
 
-        ctk.CTkFrame(frame, fg_color=C_BORDER, height=1, corner_radius=0).pack(
-            fill="x", padx=10, pady=(6, 12)
+        ctk.CTkFrame(left, fg_color=C_BORDER, height=1, corner_radius=0).pack(
+            fill="x", pady=8
         )
 
-        # Counter: cómo countea mi campeón a cada enemigo
         enemy_scores = [
-            (
-                c["championId"],
-                self._rank_score(
-                    self._data._counter_cache.get(c["championId"], []), my_cid
-                ),
-            )
+            (c["championId"], self._rank_score(
+                self._data._counter_cache.get(c["championId"], []), my_cid,
+            ))
             for c in their_team if c.get("championId", 0) > 0
         ]
-        cnt_avg = round(sum(s for _, s in enemy_scores) / len(enemy_scores), 1) if enemy_scores else 0.0
-        self._score_row(frame, "Counter Average", cnt_avg, enemy_scores)
+        if enemy_scores:
+            cnt_avg = round(sum(s for _, s in enemy_scores) / len(enemy_scores), 1)
+            self._score_row(left, "Counter", cnt_avg, enemy_scores)
+        else:
+            ctk.CTkLabel(
+                left, text="Counter  —  esperando picks...",
+                text_color=C_MUTED, font=ctk.CTkFont("Segoe UI", 10),
+            ).pack(anchor="w")
 
-    def _score_row(
-        self, parent, label: str, avg: float, scores: List[Tuple[int, float]]
-    ):
+        # ── Separador vertical ─────────────────────────────────────── #
+        ctk.CTkFrame(split, fg_color=C_BORDER, width=1, corner_radius=0).pack(
+            side="left", fill="y", padx=10,
+        )
+
+        # ── Derecha: builds con íconos circulares ──────────────────── #
+        right = ctk.CTkFrame(split, fg_color="transparent")
+        right.pack(side="left", fill="both", expand=True)
+
+        champ_name = self._data.get_champion_name(my_cid)
+        ctk.CTkLabel(
+            right,
+            text=f"BUILDS  ·  {champ_name.upper()}",
+            font=ctk.CTkFont("Segoe UI", 12, "bold"),
+            text_color=C_BLUE_BRIGHT,
+        ).pack(anchor="w", pady=(0, 8))
+
+        builds = self._builds_data
+        if builds is None:
+            ctk.CTkLabel(
+                right, text="Cargando builds...",
+                text_color=C_MUTED, font=ctk.CTkFont("Segoe UI", 11),
+            ).pack(pady=20)
+            return
+
+        runes = builds.get("runes", [])
+        items = builds.get("items", [])
+        n = min(max(len(runes), len(items)), 3)
+
+        if n == 0:
+            ctk.CTkLabel(
+                right,
+                text="No se encontraron builds para este campeón en este rol.",
+                text_color=C_MUTED, font=ctk.CTkFont("Segoe UI", 11),
+                wraplength=280,
+            ).pack(pady=20)
+            return
+
+        # 30px: 4 runas primarias + 2 secundarias + sep + 5 ítems caben en ~420px
+        SZ = (30, 30)
+        ROW_H = 46
+        for i in range(n):
+            row = ctk.CTkFrame(right, fg_color=C_CARD, corner_radius=8, height=ROW_H)
+            row.pack(fill="x", pady=3)
+            row.pack_propagate(False)  # altura fija → todas las filas simétricas
+
+            # Número de build
+            ctk.CTkLabel(
+                row, text=str(i + 1),
+                font=ctk.CTkFont("Segoe UI", 11, "bold"),
+                text_color=C_MUTED, width=22,
+            ).pack(side="left", padx=(8, 2))
+
+            # Íconos de runas (circulares):
+            # primary_rune_ids[0:4] = keystone + 3 primarias
+            # primary_rune_ids[4:6] = 2 secundarias (guardadas ahí por el parser RSC)
+            if i < len(runes):
+                rb       = runes[i]
+                all_rune = (rb.get("primary_rune_ids") or [])
+                for rid in all_rune[:6]:   # hasta 6: 4 primarias + 2 secundarias
+                    img = self._get_icon_circle(("rune", rid), SZ,
+                                                lambda r=rid: self._data.get_rune_icon(r, SZ))
+                    ctk.CTkLabel(row, image=img, text="").pack(side="left", padx=1)
+
+            # Separador fino entre runas e ítems
+            ctk.CTkFrame(row, fg_color=C_BORDER, width=1, corner_radius=0).pack(
+                side="left", fill="y", padx=5, pady=6,
+            )
+
+            # Íconos de ítems (circulares) — todos los disponibles (hasta 5)
+            if i < len(items):
+                ib = items[i]
+                for iid in (ib.get("ids") or [])[:5]:
+                    img = self._get_icon_circle(("item", iid), SZ,
+                                                lambda ii=iid: self._data.get_item_icon(ii, SZ))
+                    ctk.CTkLabel(row, image=img, text="").pack(side="left", padx=1, pady=5)
+
+    def _get_icon_circle(self, key: tuple, size: Tuple[int,int], loader) -> ctk.CTkImage:
+        cache_key = ("circle",) + key + (size,)
+        if cache_key not in self._icon_cache:
+            pil = loader()
+            if pil is None:
+                pil = self._make_placeholder_pil(size)
+            pil = self._apply_circle_mask(pil.resize(size, Image.LANCZOS).convert("RGBA"), size)
+            self._icon_cache[cache_key] = ctk.CTkImage(light_image=pil, dark_image=pil, size=size)
+        return self._icon_cache[cache_key]
+
+    @staticmethod
+    def _apply_circle_mask(pil: Image.Image, size: Tuple[int, int]) -> Image.Image:
+        mask = Image.new("L", size, 0)
+        ImageDraw.Draw(mask).ellipse((0, 0, size[0] - 1, size[1] - 1), fill=255)
+        result = Image.new("RGBA", size, (0, 0, 0, 0))
+        result.paste(pil, mask=mask)
+        return result
+
+    def _score_row(self, parent, label: str, avg: float, scores: List[Tuple[int, float]]):
         row = ctk.CTkFrame(parent, fg_color="transparent")
-        row.pack(fill="x", padx=14, pady=(0, 4))
+        row.pack(fill="x", pady=(0, 4))
 
-        # Encabezado: label + promedio
         lbl_frame = ctk.CTkFrame(row, fg_color="transparent")
-        lbl_frame.pack(anchor="w", pady=(0, 8))
+        lbl_frame.pack(anchor="w", pady=(0, 6))
 
         ctk.CTkLabel(
             lbl_frame, text=label,
@@ -613,23 +712,22 @@ class LoLAssistantApp:
             text_color=avg_color,
         ).pack(side="left")
 
-        # Iconos con puntaje debajo
         champs = ctk.CTkFrame(row, fg_color="transparent")
         champs.pack(anchor="w")
 
         for cid, score in scores:
             cell = ctk.CTkFrame(champs, fg_color="transparent")
-            cell.pack(side="left", padx=8)
+            cell.pack(side="left", padx=5)
 
-            img = self._get_icon(cid, (48, 48))
+            img = self._get_icon(cid, (38, 38))
             ctk.CTkLabel(cell, image=img, text="").pack()
 
             score_color = C_GREEN if score >= 3.5 else (C_GOLD if score >= 2.0 else C_MUTED)
             ctk.CTkLabel(
                 cell, text=f"{score:.1f}",
-                font=ctk.CTkFont("Segoe UI", 10, "bold"),
+                font=ctk.CTkFont("Segoe UI", 9, "bold"),
                 text_color=score_color,
-            ).pack(pady=(2, 0))
+            ).pack(pady=(1, 0))
 
     # ── Tarjeta de campeón ────────────────────────────────────────────── #
     def _champ_card(self, parent, champ: Dict, row: int, col: int):
@@ -717,173 +815,6 @@ class LoLAssistantApp:
             text_color=C_TEXT,
         ).pack(pady=(3, 4))
 
-    # ── Panel de builds ──────────────────────────────────────────────── #
-
-    _PATH_INFO: Dict[int, Tuple[str, str]] = {
-        8000: ("Precision",   "#c4971c"),
-        8100: ("Domination",  "#c91e1e"),
-        8200: ("Sorcery",     "#5f5fff"),
-        8300: ("Inspiration", "#32b39c"),
-        8400: ("Resolve",     "#8dd15e"),
-    }
-
-    def _builds_panel(self, my_cid: int, my_role: str):
-        frame = ctk.CTkFrame(self._content, fg_color=C_PANEL, corner_radius=10)
-        frame.pack(fill="both", expand=True)
-
-        hdr = ctk.CTkFrame(frame, fg_color="transparent")
-        hdr.pack(fill="x", padx=14, pady=(12, 6))
-
-        champ_name = self._data.get_champion_name(my_cid)
-        ctk.CTkLabel(
-            hdr,
-            text=f"BUILDS  ·  {champ_name.upper()}",
-            font=ctk.CTkFont("Segoe UI", 13, "bold"),
-            text_color=C_BLUE_BRIGHT,
-        ).pack(side="left")
-
-        ctk.CTkFrame(frame, fg_color=C_BORDER, height=1, corner_radius=0).pack(
-            fill="x", padx=10, pady=(0, 10)
-        )
-
-        builds = self._builds_data
-
-        if builds is None:
-            ctk.CTkLabel(
-                frame,
-                text="Cargando builds...",
-                text_color=C_MUTED,
-                font=ctk.CTkFont("Segoe UI", 12),
-            ).pack(pady=40)
-            return
-
-        runes = builds.get("runes", [])
-        items = builds.get("items", [])
-
-        if not runes and not items:
-            ctk.CTkLabel(
-                frame,
-                text="No se encontraron builds para este campeón en este rol.",
-                text_color=C_MUTED,
-                font=ctk.CTkFont("Segoe UI", 12),
-            ).pack(pady=40)
-            return
-
-        n = min(max(len(runes), len(items)), 3)
-        grid = ctk.CTkFrame(frame, fg_color="transparent")
-        grid.pack(fill="both", expand=True, padx=10, pady=(0, 12))
-        for col in range(n):
-            grid.columnconfigure(col, weight=1)
-
-        for i in range(n):
-            card = ctk.CTkFrame(grid, fg_color=C_CARD, corner_radius=8)
-            card.grid(row=0, column=i, padx=6, pady=4, sticky="nsew")
-
-            ctk.CTkLabel(
-                card,
-                text=f"Build {i + 1}",
-                font=ctk.CTkFont("Segoe UI", 11, "bold"),
-                text_color=C_BLUE_BRIGHT,
-            ).pack(anchor="w", padx=10, pady=(8, 6))
-
-            if i < len(runes):
-                self._rune_section(card, runes[i])
-
-            ctk.CTkFrame(card, fg_color=C_BORDER, height=1, corner_radius=0).pack(
-                fill="x", padx=8, pady=(6, 4)
-            )
-
-            if i < len(items):
-                self._item_section(card, items[i])
-
-            ctk.CTkLabel(card, text="", height=6).pack()
-
-    def _rune_section(self, parent, rune_build: Dict):
-        sec = ctk.CTkFrame(parent, fg_color="transparent")
-        sec.pack(fill="x", padx=10, pady=(0, 2))
-
-        primary_rune_ids  = rune_build.get("primary_rune_ids", [])
-        primary_page_id   = rune_build.get("primary_page_id")
-        secondary_page_id = rune_build.get("secondary_page_id")
-        wr                = rune_build.get("win_rate", 0)
-
-        # Keystone: icono + nombre
-        keystone_id = primary_rune_ids[0] if primary_rune_ids else None
-        if keystone_id:
-            ks_row = ctk.CTkFrame(sec, fg_color="transparent")
-            ks_row.pack(anchor="w", pady=(0, 3))
-            img = self._get_rune_icon(keystone_id, (30, 30))
-            ctk.CTkLabel(ks_row, image=img, text="").pack(side="left", padx=(0, 6))
-            name = self._data.get_rune_name(keystone_id) or str(keystone_id)
-            ctk.CTkLabel(
-                ks_row,
-                text=name,
-                font=ctk.CTkFont("Segoe UI", 10, "bold"),
-                text_color=C_TEXT,
-                wraplength=120,
-                justify="left",
-            ).pack(side="left")
-
-        # Camino secundario
-        if secondary_page_id:
-            sec_name, sec_color = self._PATH_INFO.get(secondary_page_id, ("", C_MUTED))
-            if sec_name:
-                ctk.CTkLabel(
-                    sec,
-                    text=f"+ {sec_name}",
-                    font=ctk.CTkFont("Segoe UI", 9),
-                    text_color=sec_color,
-                ).pack(anchor="w")
-
-        # Win rate
-        if wr:
-            wr_color = C_GREEN if wr >= 52 else (C_GOLD if wr >= 50 else C_MUTED)
-            ctk.CTkLabel(
-                sec,
-                text=f"{wr:.1f}% WR",
-                font=ctk.CTkFont("Segoe UI", 9, "bold"),
-                text_color=wr_color,
-            ).pack(anchor="w", pady=(2, 0))
-
-    def _item_section(self, parent, item_build: Dict):
-        sec = ctk.CTkFrame(parent, fg_color="transparent")
-        sec.pack(fill="x", padx=10, pady=(0, 2))
-
-        ids = item_build.get("ids", [])
-        wr  = item_build.get("win_rate", 0)
-
-        icons_row = ctk.CTkFrame(sec, fg_color="transparent")
-        icons_row.pack(anchor="w", pady=(0, 3))
-        for item_id in ids[:5]:
-            img = self._get_item_icon(item_id, (30, 30))
-            ctk.CTkLabel(icons_row, image=img, text="").pack(side="left", padx=2)
-
-        if wr:
-            wr_color = C_GREEN if wr >= 52 else (C_GOLD if wr >= 50 else C_MUTED)
-            ctk.CTkLabel(
-                sec,
-                text=f"{wr:.1f}% WR",
-                font=ctk.CTkFont("Segoe UI", 9, "bold"),
-                text_color=wr_color,
-            ).pack(anchor="w")
-
-    def _get_item_icon(self, item_id: int, size: Tuple[int, int]) -> ctk.CTkImage:
-        key = ("item", item_id, size)
-        if key not in self._icon_cache:
-            pil = self._data.get_item_icon(item_id, size)
-            if pil is None:
-                pil = self._make_placeholder_pil(size)
-            self._icon_cache[key] = ctk.CTkImage(light_image=pil, dark_image=pil, size=size)
-        return self._icon_cache[key]
-
-    def _get_rune_icon(self, rune_id: int, size: Tuple[int, int]) -> ctk.CTkImage:
-        key = ("rune", rune_id, size)
-        if key not in self._icon_cache:
-            pil = self._data.get_rune_icon(rune_id, size)
-            if pil is None:
-                pil = self._make_placeholder_pil(size)
-            self._icon_cache[key] = ctk.CTkImage(light_image=pil, dark_image=pil, size=size)
-        return self._icon_cache[key]
 
     # ------------------------------------------------------------------ #
     #  Iconos                                                              #
@@ -1116,12 +1047,8 @@ class LoLAssistantApp:
                 daemon=True,
             ).start()
 
-        all_picked = (
-            my_champ > 0
-            and all(c.get("championId", 0) > 0 for c in my_team)
-            and all(c.get("championId", 0) > 0 for c in their_team)
-        )
-        if all_picked and not self._synergy_fetched:
+        # Fetchear sinergia en cuanto el usuario pickea (no esperar a all_picked)
+        if my_champ > 0 and not self._synergy_fetched:
             self._synergy_fetched = True
             threading.Thread(
                 target=self._fetch_synergy_bg,
@@ -1154,6 +1081,9 @@ class LoLAssistantApp:
         if self._refresh_job:
             self._root.after_cancel(self._refresh_job)
             self._refresh_job = None
+        # Liberar RAM acumulada durante la partida
+        self._icon_cache.clear()
+        self._data.clear_game_cache()
 
     def _on_data_ready(self, _=None):
         if self._phase == "ChampSelect" and self._session:

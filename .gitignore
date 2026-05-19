@@ -1,5 +1,6 @@
 # Compilados PyInstaller
 build/
+*.spec
 
 # Cache de runtime (se genera automáticamente al correr la app)
 cache/
