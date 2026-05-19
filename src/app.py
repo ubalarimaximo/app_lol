@@ -1,6 +1,7 @@
 import queue
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -20,21 +21,23 @@ from .data_manager import DataManager
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-C_BG          = "#0a0e17"
-C_PANEL       = "#0f1623"
-C_CARD        = "#111d2e"
-C_ACCENT      = "#1a3a5c"
-C_GOLD        = "#c8aa6e"
-C_GOLD_BRIGHT = "#f0e2b2"
-C_GREEN       = "#1fa848"
+C_BG          = "#191c27"   # gris oscuro base
+C_PANEL       = "#1f2335"   # panel principal
+C_CARD        = "#1a1e2e"   # tarjetas
+C_ACCENT      = "#1e4080"   # fila del jugador (azul Francia oscuro)
+C_GOLD        = "#c8a84b"   # dorado (solo detalles puntuales)
+C_GOLD_BRIGHT = "#e2c97a"   # dorado claro (título app)
+C_BLUE        = "#2b6cb0"   # azul Francia principal
+C_BLUE_BRIGHT = "#4a8fd4"   # azul Francia claro (cabeceras)
+C_GREEN       = "#27ae60"
 C_RED         = "#c0392b"
-C_TEXT        = "#d4dae6"
-C_MUTED       = "#4d5e7a"
-C_BORDER      = "#1c2e45"
-C_ALLY        = "#1e5fa0"
+C_TEXT        = "#d0dae8"
+C_MUTED       = "#566880"
+C_BORDER      = "#2a3a55"   # borde con tinte azul
+C_ALLY        = "#1a3d7a"
 C_ENEMY       = "#8b1a1a"
 
-TIER_COLOR = {"S": "#ffd700", "A": "#00e676", "B": "#40c4ff", "C": "#ce93d8", "D": "#90a4ae"}
+TIER_COLOR = {"S": "#c8a84b", "A": "#2b6cb0", "B": "#4a8fd4", "C": "#566880", "D": "#4a5f75"}
 
 
 ROLE_LABEL = {
@@ -99,6 +102,15 @@ class LoLAssistantApp:
         self._synergy_scores:  Dict[int,int] = {}      # cid → puntos acumulados (sinergias)
         self._synergy_fetched: bool          = False   # ya pedimos sinergia final este champ select
 
+        # builds del campeón propio
+        self._builds_fetched_for: int            = 0     # cid para el que fetcheamos builds
+        self._builds_data:        Optional[Dict] = None  # resultado del fetch
+
+        # animación de lockeo y debounce de refresh
+        self._prev_picks:   Dict[int, int]   = {}   # cellId → último cid conocido
+        self._lock_in_times: Dict[int, float] = {}  # cellId → timestamp del pick
+        self._refresh_job:  Optional[str]    = None # ID del after() pendiente
+
         self._load_role_icons()
         self._build_ui()
         self._wire_lcu()
@@ -132,9 +144,10 @@ class LoLAssistantApp:
             "champ_select":     self._on_champ_select,
             "champ_select_end": self._on_champ_select_end,
             "data_ready":       self._on_data_ready,
-            "counters_updated":  self._on_counters_updated,
+            "counters_updated":       self._on_counters_updated,
             "synergy_scores_updated": self._on_synergy_scores_updated,
-            "synergy_ready":    self._on_synergy_ready,
+            "synergy_ready":          self._on_synergy_ready,
+            "builds_ready":           self._on_builds_ready,
         }
         fn = handlers.get(kind)
         if fn:
@@ -195,13 +208,20 @@ class LoLAssistantApp:
     #  Vistas                                                              #
     # ------------------------------------------------------------------ #
 
-    def _clear(self):
-        for w in self._content.winfo_children():
-            w.destroy()
+    def _prepare_content(self) -> ctk.CTkFrame:
+        """Crea un nuevo self._content invisible y devuelve el viejo."""
+        old = self._content
+        self._content = ctk.CTkFrame(self._root, fg_color="transparent")
+        return old
+
+    def _commit_content(self, old: ctk.CTkFrame):
+        """Muestra el nuevo self._content y destruye el viejo de forma atómica."""
+        self._content.pack(fill="both", expand=True, padx=16, pady=12)
+        old.destroy()
 
     # ── Vista idle ────────────────────────────────────────────────────── #
     def _show_idle(self, msg: str, sub: str = ""):
-        self._clear()
+        old = self._prepare_content()
         frame = ctk.CTkFrame(self._content, fg_color="transparent")
         frame.place(relx=0.5, rely=0.45, anchor="center")
 
@@ -229,10 +249,11 @@ class LoLAssistantApp:
                 text_color=C_MUTED,
                 wraplength=400,
             ).pack(pady=6)
+        self._commit_content(old)
 
     # ── Vista champion select ──────────────────────────────────────────── #
     def _show_champ_select(self, session: Dict):
-        self._clear()
+        old = self._prepare_content()
 
         local_cell  = session.get("localPlayerCellId", -1)
         my_team     = session.get("myTeam", [])
@@ -287,9 +308,13 @@ class LoLAssistantApp:
         )
         if all_picks_done:
             self._scores_panel(my_champ, my_team, their_team, local_cell)
+        elif my_champ > 0:
+            self._builds_panel(my_champ, my_role)
         else:
             role_display = ROLE_LABEL.get(my_role, my_role).upper() if my_role else "SIN ROL ASIGNADO"
             self._recommendations_panel(my_role, enemy_ids, ally_ids + ban_ids, role_display)
+
+        self._commit_content(old)
 
     # ── Panel de equipo ──────────────────────────────────────────────── #
     def _team_panel(
@@ -301,7 +326,7 @@ class LoLAssistantApp:
         ctk.CTkLabel(
             panel, text=title,
             font=ctk.CTkFont("Segoe UI", 12, "bold"),
-            text_color=C_GOLD,
+            text_color=C_BLUE_BRIGHT,
         ).pack(padx=14, pady=(10, 6), anchor="w")
 
         sep = ctk.CTkFrame(panel, fg_color=C_BORDER, height=1, corner_radius=0)
@@ -313,12 +338,20 @@ class LoLAssistantApp:
             position = cell.get("assignedPosition", "")
             is_me    = (cell_id == local_cell)
 
+            lock_age    = time.time() - self._lock_in_times.get(cell_id, float("inf"))
+            is_new_lock = cid > 0 and lock_age < 1.5
+
             row = ctk.CTkFrame(
                 panel,
                 fg_color=C_ACCENT if is_me else "transparent",
                 corner_radius=6,
+                border_width=2 if is_new_lock else 0,
+                border_color=C_GOLD if is_new_lock else C_BORDER,
             )
             row.pack(fill="x", padx=8, pady=2)
+
+            if is_new_lock:
+                self._animate_lock_row(row)
 
             # Icono
             img = self._get_icon(cid, (36, 36)) if cid > 0 else self._placeholder_icon((36, 36))
@@ -340,7 +373,7 @@ class LoLAssistantApp:
                 row,
                 text=f"{name}{suffix}",
                 font=ctk.CTkFont("Segoe UI", 12, "bold" if is_me else "normal"),
-                text_color=C_GOLD if is_me else C_TEXT,
+                text_color="#ffffff" if is_me else C_TEXT,
                 anchor="w",
             ).pack(side="left", fill="x", expand=True, padx=(0, 8))
 
@@ -436,7 +469,7 @@ class LoLAssistantApp:
             hdr,
             text=f"{source}{counter_tag}  —  ",
             font=ctk.CTkFont("Segoe UI", 13, "bold"),
-            text_color=C_GOLD_BRIGHT,
+            text_color=C_BLUE_BRIGHT,
         ).pack(side="left")
 
         role_img = self._role_icons.get(role)
@@ -449,7 +482,7 @@ class LoLAssistantApp:
             hdr,
             text=role_label,
             font=ctk.CTkFont("Segoe UI", 13, "bold"),
-            text_color=C_GOLD_BRIGHT,
+            text_color=C_BLUE_BRIGHT,
         ).pack(side="left")
 
         sep = ctk.CTkFrame(frame, fg_color=C_BORDER, height=1, corner_radius=0)
@@ -524,7 +557,7 @@ class LoLAssistantApp:
         ctk.CTkLabel(
             hdr, text="ANÁLISIS FINAL",
             font=ctk.CTkFont("Segoe UI", 13, "bold"),
-            text_color=C_GOLD_BRIGHT,
+            text_color=C_BLUE_BRIGHT,
         ).pack(side="left")
 
         sep = ctk.CTkFrame(frame, fg_color=C_BORDER, height=1, corner_radius=0)
@@ -625,11 +658,12 @@ class LoLAssistantApp:
             tier_frame = ctk.CTkFrame(right, fg_color=TIER_COLOR.get(tier, C_MUTED), corner_radius=4, width=32, height=22)
             tier_frame.pack(anchor="w", pady=(2, 2))
             tier_frame.pack_propagate(False)
+            tier_text = C_BG if tier == "S" else "#ffffff"
             ctk.CTkLabel(
                 tier_frame,
                 text=tier,
                 font=ctk.CTkFont("Segoe UI", 12, "bold"),
-                text_color=C_BG,
+                text_color=tier_text,
             ).place(relx=0.5, rely=0.5, anchor="center")
         elif mastery:
             M_COLOR = {7: C_GOLD, 6: "#b84dff", 5: "#40c4ff"}
@@ -682,6 +716,174 @@ class LoLAssistantApp:
             font=ctk.CTkFont("Segoe UI", 10, "bold"),
             text_color=C_TEXT,
         ).pack(pady=(3, 4))
+
+    # ── Panel de builds ──────────────────────────────────────────────── #
+
+    _PATH_INFO: Dict[int, Tuple[str, str]] = {
+        8000: ("Precision",   "#c4971c"),
+        8100: ("Domination",  "#c91e1e"),
+        8200: ("Sorcery",     "#5f5fff"),
+        8300: ("Inspiration", "#32b39c"),
+        8400: ("Resolve",     "#8dd15e"),
+    }
+
+    def _builds_panel(self, my_cid: int, my_role: str):
+        frame = ctk.CTkFrame(self._content, fg_color=C_PANEL, corner_radius=10)
+        frame.pack(fill="both", expand=True)
+
+        hdr = ctk.CTkFrame(frame, fg_color="transparent")
+        hdr.pack(fill="x", padx=14, pady=(12, 6))
+
+        champ_name = self._data.get_champion_name(my_cid)
+        ctk.CTkLabel(
+            hdr,
+            text=f"BUILDS  ·  {champ_name.upper()}",
+            font=ctk.CTkFont("Segoe UI", 13, "bold"),
+            text_color=C_BLUE_BRIGHT,
+        ).pack(side="left")
+
+        ctk.CTkFrame(frame, fg_color=C_BORDER, height=1, corner_radius=0).pack(
+            fill="x", padx=10, pady=(0, 10)
+        )
+
+        builds = self._builds_data
+
+        if builds is None:
+            ctk.CTkLabel(
+                frame,
+                text="Cargando builds...",
+                text_color=C_MUTED,
+                font=ctk.CTkFont("Segoe UI", 12),
+            ).pack(pady=40)
+            return
+
+        runes = builds.get("runes", [])
+        items = builds.get("items", [])
+
+        if not runes and not items:
+            ctk.CTkLabel(
+                frame,
+                text="No se encontraron builds para este campeón en este rol.",
+                text_color=C_MUTED,
+                font=ctk.CTkFont("Segoe UI", 12),
+            ).pack(pady=40)
+            return
+
+        n = min(max(len(runes), len(items)), 3)
+        grid = ctk.CTkFrame(frame, fg_color="transparent")
+        grid.pack(fill="both", expand=True, padx=10, pady=(0, 12))
+        for col in range(n):
+            grid.columnconfigure(col, weight=1)
+
+        for i in range(n):
+            card = ctk.CTkFrame(grid, fg_color=C_CARD, corner_radius=8)
+            card.grid(row=0, column=i, padx=6, pady=4, sticky="nsew")
+
+            ctk.CTkLabel(
+                card,
+                text=f"Build {i + 1}",
+                font=ctk.CTkFont("Segoe UI", 11, "bold"),
+                text_color=C_BLUE_BRIGHT,
+            ).pack(anchor="w", padx=10, pady=(8, 6))
+
+            if i < len(runes):
+                self._rune_section(card, runes[i])
+
+            ctk.CTkFrame(card, fg_color=C_BORDER, height=1, corner_radius=0).pack(
+                fill="x", padx=8, pady=(6, 4)
+            )
+
+            if i < len(items):
+                self._item_section(card, items[i])
+
+            ctk.CTkLabel(card, text="", height=6).pack()
+
+    def _rune_section(self, parent, rune_build: Dict):
+        sec = ctk.CTkFrame(parent, fg_color="transparent")
+        sec.pack(fill="x", padx=10, pady=(0, 2))
+
+        primary_rune_ids  = rune_build.get("primary_rune_ids", [])
+        primary_page_id   = rune_build.get("primary_page_id")
+        secondary_page_id = rune_build.get("secondary_page_id")
+        wr                = rune_build.get("win_rate", 0)
+
+        # Keystone: icono + nombre
+        keystone_id = primary_rune_ids[0] if primary_rune_ids else None
+        if keystone_id:
+            ks_row = ctk.CTkFrame(sec, fg_color="transparent")
+            ks_row.pack(anchor="w", pady=(0, 3))
+            img = self._get_rune_icon(keystone_id, (30, 30))
+            ctk.CTkLabel(ks_row, image=img, text="").pack(side="left", padx=(0, 6))
+            name = self._data.get_rune_name(keystone_id) or str(keystone_id)
+            ctk.CTkLabel(
+                ks_row,
+                text=name,
+                font=ctk.CTkFont("Segoe UI", 10, "bold"),
+                text_color=C_TEXT,
+                wraplength=120,
+                justify="left",
+            ).pack(side="left")
+
+        # Camino secundario
+        if secondary_page_id:
+            sec_name, sec_color = self._PATH_INFO.get(secondary_page_id, ("", C_MUTED))
+            if sec_name:
+                ctk.CTkLabel(
+                    sec,
+                    text=f"+ {sec_name}",
+                    font=ctk.CTkFont("Segoe UI", 9),
+                    text_color=sec_color,
+                ).pack(anchor="w")
+
+        # Win rate
+        if wr:
+            wr_color = C_GREEN if wr >= 52 else (C_GOLD if wr >= 50 else C_MUTED)
+            ctk.CTkLabel(
+                sec,
+                text=f"{wr:.1f}% WR",
+                font=ctk.CTkFont("Segoe UI", 9, "bold"),
+                text_color=wr_color,
+            ).pack(anchor="w", pady=(2, 0))
+
+    def _item_section(self, parent, item_build: Dict):
+        sec = ctk.CTkFrame(parent, fg_color="transparent")
+        sec.pack(fill="x", padx=10, pady=(0, 2))
+
+        ids = item_build.get("ids", [])
+        wr  = item_build.get("win_rate", 0)
+
+        icons_row = ctk.CTkFrame(sec, fg_color="transparent")
+        icons_row.pack(anchor="w", pady=(0, 3))
+        for item_id in ids[:5]:
+            img = self._get_item_icon(item_id, (30, 30))
+            ctk.CTkLabel(icons_row, image=img, text="").pack(side="left", padx=2)
+
+        if wr:
+            wr_color = C_GREEN if wr >= 52 else (C_GOLD if wr >= 50 else C_MUTED)
+            ctk.CTkLabel(
+                sec,
+                text=f"{wr:.1f}% WR",
+                font=ctk.CTkFont("Segoe UI", 9, "bold"),
+                text_color=wr_color,
+            ).pack(anchor="w")
+
+    def _get_item_icon(self, item_id: int, size: Tuple[int, int]) -> ctk.CTkImage:
+        key = ("item", item_id, size)
+        if key not in self._icon_cache:
+            pil = self._data.get_item_icon(item_id, size)
+            if pil is None:
+                pil = self._make_placeholder_pil(size)
+            self._icon_cache[key] = ctk.CTkImage(light_image=pil, dark_image=pil, size=size)
+        return self._icon_cache[key]
+
+    def _get_rune_icon(self, rune_id: int, size: Tuple[int, int]) -> ctk.CTkImage:
+        key = ("rune", rune_id, size)
+        if key not in self._icon_cache:
+            pil = self._data.get_rune_icon(rune_id, size)
+            if pil is None:
+                pil = self._make_placeholder_pil(size)
+            self._icon_cache[key] = ctk.CTkImage(light_image=pil, dark_image=pil, size=size)
+        return self._icon_cache[key]
 
     # ------------------------------------------------------------------ #
     #  Iconos                                                              #
@@ -739,7 +941,7 @@ class LoLAssistantApp:
 
     @staticmethod
     def _make_placeholder_pil(size: Tuple[int, int]) -> Image.Image:
-        img  = Image.new("RGB", size, color=(40, 55, 71))
+        img  = Image.new("RGB", size, color=(26, 30, 46))
         draw = ImageDraw.Draw(img)
         draw.text(
             (size[0] // 2 - 4, size[1] // 2 - 7), "?",
@@ -785,17 +987,49 @@ class LoLAssistantApp:
         self._data.fetch_synergy_for(my_cid, my_role)
         self._enqueue("synergy_ready")
 
-    def _on_counters_updated(self, _=None):
+    _LOCK_BORDER: List[str] = ["#c8aa6e", "#a08848", "#706030", "#404020", "#202010", "transparent"]
+
+    def _animate_lock_row(self, row: ctk.CTkFrame, step: int = 0):
+        if not row.winfo_exists():
+            return
+        if step < len(self._LOCK_BORDER):
+            try:
+                row.configure(border_color=self._LOCK_BORDER[step])
+                self._root.after(220, lambda: self._animate_lock_row(row, step + 1))
+            except Exception:
+                pass
+        else:
+            try:
+                row.configure(border_width=0)
+            except Exception:
+                pass
+
+    def _schedule_refresh(self):
+        if self._refresh_job:
+            self._root.after_cancel(self._refresh_job)
+        self._refresh_job = self._root.after(180, self._do_refresh)
+
+    def _do_refresh(self):
+        self._refresh_job = None
         if self._session:
             self._show_champ_select(self._session)
+
+    def _on_counters_updated(self, _=None):
+        self._schedule_refresh()
 
     def _on_synergy_scores_updated(self, _=None):
-        if self._session:
-            self._show_champ_select(self._session)
+        self._schedule_refresh()
+
+    def _fetch_builds_bg(self, cid: int, role: str):
+        builds = self._data.fetch_builds_for(cid, role)
+        self._builds_data = builds
+        self._enqueue("builds_ready")
+
+    def _on_builds_ready(self, _=None):
+        self._schedule_refresh()
 
     def _on_synergy_ready(self, _=None):
-        if self._session:
-            self._show_champ_select(self._session)
+        self._schedule_refresh()
 
     def _on_disconnected(self, _=None):
         self._lbl_status.configure(text="● Desconectado", text_color=C_RED)
@@ -813,11 +1047,10 @@ class LoLAssistantApp:
         label = PHASE_LABELS.get(phase, phase)
         self._lbl_phase.configure(text=label)
 
-        if phase == "ChampSelect":
-            return  # lo maneja _on_champ_select
+        if phase in ("ChampSelect", "InProgress"):
+            return  # ChampSelect lo maneja _on_champ_select; InProgress mantiene la info visible
 
         messages = {
-            "InProgress":      ("En partida  🎮", ""),
             "EndOfGame":       ("Partida terminada", ""),
             "WaitingForStats": ("Esperando resultados...", ""),
             "PreEndOfGame":    ("Finalizando partida...", ""),
@@ -872,6 +1105,17 @@ class LoLAssistantApp:
 
         my_champ = my_cell.get("championId", 0)
         my_role  = my_cell.get("assignedPosition", "")
+
+        # Cuando el usuario pickea su campeón, fetchear builds en background
+        if my_champ > 0 and my_champ != self._builds_fetched_for:
+            self._builds_fetched_for = my_champ
+            self._builds_data = None
+            threading.Thread(
+                target=self._fetch_builds_bg,
+                args=(my_champ, my_role),
+                daemon=True,
+            ).start()
+
         all_picked = (
             my_champ > 0
             and all(c.get("championId", 0) > 0 for c in my_team)
@@ -885,6 +1129,14 @@ class LoLAssistantApp:
                 daemon=True,
             ).start()
 
+        # Detectar nuevos picks para la animación de lockeo
+        for cell in my_team + their_team:
+            cid_now = cell.get("championId", 0)
+            cid_old = self._prev_picks.get(cell.get("cellId", -1), 0)
+            if cid_now > 0 and cid_old == 0:
+                self._lock_in_times[cell.get("cellId", -1)] = time.time()
+            self._prev_picks[cell.get("cellId", -1)] = cid_now
+
         self._show_champ_select(session)
 
     def _on_champ_select_end(self, _=None):
@@ -895,6 +1147,13 @@ class LoLAssistantApp:
         self._counter_scores   = {}
         self._synergy_scores   = {}
         self._synergy_fetched  = False
+        self._builds_fetched_for = 0
+        self._builds_data        = None
+        self._prev_picks         = {}
+        self._lock_in_times      = {}
+        if self._refresh_job:
+            self._root.after_cancel(self._refresh_job)
+            self._refresh_job = None
 
     def _on_data_ready(self, _=None):
         if self._phase == "ChampSelect" and self._session:
